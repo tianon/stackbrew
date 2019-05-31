@@ -1,0 +1,133 @@
+strategy:
+  matrix:
+    linux:
+      azureImage: 'ubuntu-16.04'
+      goImage: 'golang:1.12-stretch'
+      goHostPath: '"$PWD/bashbrew/go"'
+      goContPath: '/bashbrew'
+    windows-1803:
+      azureImage: 'win1803'
+      goImage: 'golang:1.12-windowsservercore-1803'
+      goHostPath: '"$(cygpath --absolute --windows "$PWD/bashbrew/go")"'
+      goContPath: 'C:\\bashbrew'
+
+pool:
+  vmImage: $(azureImage)
+
+steps:
+  - bash: 'env | sort'
+    displayName: Environment Variables
+
+  - bash: |
+      set -Eeuo pipefail -x
+      .azure/wait-for-docker.sh
+      docker pull $(goImage)
+    displayName: Pull $(goImage)
+  - bash: |
+      set -Eeuo pipefail
+      export PATH="$PWD/bashbrew/go/bin:$PATH" BASHBREW_LIBRARY="$PWD/library"
+      set -x
+      docker run --rm -v $(goHostPath):$(goContPath) -w $(goContPath) -e GO111MODULE=on $(goImage) go build -o bin/bashbrew -mod vendor -v bashbrew/src/bashbrew
+      bashbrew --help
+    displayName: Build Bashbrew
+
+    # TODO update testing harness to be able to check whether a given image would run a given test so that we can have test changes automatically tested on images they affect too (might be a bit much since it would potentially apply to all images, so there'd need to be a limit -- maybe 5-10 images?)
+  - bash: |
+      set -Eeuo pipefail -x
+      git fetch https://github.com/docker-library/official-images.git master:origin-master
+      git fetch https://github.com/docker-library/official-images.git pull/$(System.PullRequest.PullRequestNumber)/merge:pr-merge
+      images="$(git diff --name-only origin-master...pr-merge -- library | xargs -rn1 basename || :)"
+      echo "##vso[task.setvariable variable=OI_PR_IMAGES;]$images"
+    displayName: Gather (PR) modified images list
+    condition: variables['System.PullRequest.PullRequestNumber']
+
+  - bash: |
+      set -Eeuo pipefail
+      export PATH="$PWD/bashbrew/go/bin:$PATH" BASHBREW_LIBRARY="$PWD/library"
+      if [ -z "${OI_PR_IMAGES:-}" ]; then
+        exec > /dev/null
+        OI_PR_IMAGES='--all'
+      fi
+      set -x
+      bashbrew list --uniq $OI_PR_IMAGES
+      bashbrew list $OI_PR_IMAGES
+    displayName: '"bashbrew list"'
+
+  - bash: |
+      set -Eeuo pipefail
+      export PATH="$PWD/bashbrew/go/bin:$PATH" BASHBREW_LIBRARY="$PWD/library"
+      bashbrew cat $OI_PR_IMAGES
+      arches="$(bashbrew cat --format '{{ range .Entries }}{{ .Architectures | join "\n" }}{{ end }}' $OI_PR_IMAGES | sort -u)"
+      if grep '^windows-amd64$' <<<"$arches"; then
+        # another variable for whether any are "windows-amd64" with the 1803 constraints and thus worth Windows-testing (bashbrew list, bashbrew cat testing)
+        echo "##vso[task.setvariable variable=OI_PR_DOTEST;]1"
+      fi
+    displayName: '"bashbrew cat" (PR)'
+    condition: variables['OI_PR_IMAGES']
+
+  - bash: |
+      set -Eeuo pipefail
+      export PATH="$PWD/bashbrew/go/bin:$PATH" BASHBREW_LIBRARY="$PWD/library"
+
+      if badTags="$(bashbrew list $OI_PR_IMAGES | grep -E ':.+latest.*|:.*latest.+')" && [ -n "$badTags" ]; then
+        echo >&2
+        echo >&2 "Incorrectly formatted 'latest' tags detected:"
+        echo >&2 ' ' $badTags
+        echo >&2
+        echo >&2 'Read https://github.com/docker-library/official-images#tags-and-aliases for more details.'
+        echo >&2
+        exit 1
+      fi
+
+      if naughtyFrom="$(./naughty-from.sh $OI_PR_IMAGES)" && [ -n "$naughtyFrom" ]; then
+        echo >&2
+        echo >&2 "Invalid 'FROM' / 'Architectures' combinations detected:"
+        echo >&2
+        echo >&2 "$naughtyFrom"
+        echo >&2
+        echo >&2 'Read https://github.com/docker-library/official-images#multiple-architectures for more details.'
+        echo >&2
+        exit 1
+      fi
+
+      if naughtyConstraints="$(./naughty-constraints.sh $OI_PR_IMAGES)" && [ -n "$naughtyConstraints" ]; then
+        echo >&2
+        echo >&2 "Invalid 'FROM' + 'Constraints' combinations detected:"
+        echo >&2
+        echo >&2 "$naughtyConstraints"
+        echo >&2
+        exit 1
+      fi
+    displayName: Verify (PR) tags and base images
+    condition: variables['OI_PR_IMAGES']
+
+  - bash: |
+      set -Eeuo pipefail
+      export PATH="$PWD/bashbrew/go/bin:$PATH" BASHBREW_LIBRARY="$PWD/library"
+      ./diff-pr.sh '$(System.PullRequest.PullRequestNumber)' $OI_PR_IMAGES
+      # TODO figure out the simplest way to make this an auto-updated comment on the PR itself
+    displayName: Diff (PR)
+    condition: |
+      and(
+        variables['System.PullRequest.PullRequestNumber'],
+        variables['OI_PR_IMAGES']
+      )
+
+  - bash: |
+      set -Eeuo pipefail
+      export PATH="$PWD/bashbrew/go/bin:$PATH" BASHBREW_LIBRARY="$PWD/library"
+      ./test-pr.sh '$(System.PullRequest.PullRequestNumber)' $OI_PR_IMAGES
+    displayName: Test (PR)
+    condition: |
+      and(
+        variables['System.PullRequest.PullRequestNumber'],
+        variables['OI_PR_IMAGES'],
+        or(
+          eq( variables['Agent.OS'], 'Linux' ),
+          variables['OI_PR_DOTEST']
+        )
+      )
+    timeoutInMinutes: 0
+    enabled: false # there are many images that can't build all tags fully within Azure's 6 hour timeout (`php`, etc)
+
+# vim:set tabstop=2 shiftwidth=2:

@@ -244,7 +244,7 @@ for image in "${images[@]}"; do
 	fi
 done
 git -C temp add . || :
-git -C temp commit --quiet --allow-empty -m 'initial' || :
+git -C temp -c user.name='bogus' -c user.email='bogus@bogus' commit --quiet --allow-empty -m 'initial' || :
 
 git -C oi checkout --quiet pull
 
